@@ -1,0 +1,26 @@
+{
+  "num_samples_used": 507,
+  "num_features": 1260,
+  "top5_features": [
+    {
+      "feature": "f_0",
+      "mean_abs_shap": 0.0
+    },
+    {
+      "feature": "f_837",
+      "mean_abs_shap": 0.0
+    },
+    {
+      "feature": "f_844",
+      "mean_abs_shap": 0.0
+    },
+    {
+      "feature": "f_843",
+      "mean_abs_shap": 0.0
+    },
+    {
+      "feature": "f_842",
+      "mean_abs_shap": 0.0
+    }
+  ]
+}
