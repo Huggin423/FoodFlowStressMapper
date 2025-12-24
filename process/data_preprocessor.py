@@ -1,3 +1,12 @@
+"""
+骑手配送压力预测 - 数据预处理与DSI计算模块 (增强版)
+修复内容:
+  1. 日期解析bug: 从GeoJSON文件名正确提取日期
+  2. 天气字段bug: 使用模糊匹配改善天气分类
+  3. DSI计算: 基于物理约束的配送紧迫指数
+新增内容:
+  4. 累积特征构造: 构造当天累计单量、累计里程、累计工作时长，捕捉疲劳效应
+"""
 import pandas as pd
 import numpy as np
 import geopandas as gpd
@@ -10,11 +19,10 @@ from collections import defaultdict
 import math
 warnings.filterwarnings('ignore')
 
+
 class DeliveryRiderDataPreprocessor:
     def __init__(self, data_dir):
-        """
-        初始化数据预处理器
-        """
+        """初始化数据预处理器"""
         self.data_dir = Path(data_dir)
         self.features_df = pd.DataFrame()
         
@@ -22,7 +30,23 @@ class DeliveryRiderDataPreprocessor:
         """加载所有GeoJSON文件"""
         geojson_files = list(self.data_dir.glob("DeliveryRoutes_*.geojson"))
         print(f"找到 {len(geojson_files)} 个GeoJSON文件")
-        return sorted(geojson_files)  # 确保按日期排序
+        return sorted(geojson_files)
+    
+    def extract_date_from_filename(self, filename):
+        """从文件名中提取日期"""
+        try:
+            stem = Path(filename).stem
+            date_str = stem.replace('DeliveryRoutes_', '')
+            
+            if len(date_str) == 8 and date_str.isdigit():
+                datetime.strptime(date_str, '%Y%m%d')
+                return date_str
+            else:
+                print(f"  [WARN] 文件名日期格式异常: {stem}")
+                return None
+        except Exception as e:
+            print(f"  [WARN] 日期提取失败 {filename}: {e}")
+            return None
     
     def parse_complex_fields(self, properties):
         """手动解析复杂字段（列表类型）"""
@@ -33,7 +57,6 @@ class DeliveryRiderDataPreprocessor:
                 return value
             if isinstance(value, str):
                 try:
-                    # 处理可能的格式问题
                     value = value.replace("'", '"').replace("None", "null")
                     parsed = json.loads(value)
                     return parsed if isinstance(parsed, list) else default
@@ -58,7 +81,6 @@ class DeliveryRiderDataPreprocessor:
             if feature_type == 'route':
                 route_id = self.get_route_id(properties)
                 if route_id:
-                    # 缓存路线级别的完整数据
                     route_cache[route_id] = properties
         
         return route_cache
@@ -89,7 +111,6 @@ class DeliveryRiderDataPreprocessor:
             return 0, 1, 0
         
         try:
-            # 过滤无效时间值
             valid_times = [float(t) for t in time_list if t is not None and float(t) > 0]
             if len(valid_times) < 2:
                 return 0, 1, 0
@@ -98,7 +119,6 @@ class DeliveryRiderDataPreprocessor:
             time_diffs = np.diff(valid_times)
             avg_interval = np.mean(time_diffs) if len(time_diffs) > 0 else 0
             
-            # 计算连续任务量
             continuous_orders = 1
             max_continuous = 1
             for diff in time_diffs:
@@ -118,17 +138,14 @@ class DeliveryRiderDataPreprocessor:
     def haversine_distance(self, coord1, coord2):
         """计算两个坐标点之间的haversine距离（单位：米）"""
         try:
-            # 将经纬度转换为弧度
             lat1, lon1 = math.radians(coord1[1]), math.radians(coord1[0])
             lat2, lon2 = math.radians(coord2[1]), math.radians(coord2[0])
             
-            # haversine公式
             dlat = lat2 - lat1
             dlon = lon2 - lon1
             a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
             c = 2 * math.asin(math.sqrt(a))
-            r = 6371000  # 地球半径（米）
-            
+            r = 6371000 
             return c * r
         except:
             return 0
@@ -142,16 +159,13 @@ class DeliveryRiderDataPreprocessor:
             return 1.0
         
         try:
-            # 获取起点和终点坐标
             start_coord = coordinates[0]
             end_coord = coordinates[-1]
             
-            # 计算直线距离
             straight_distance = self.haversine_distance(start_coord, end_coord)
             
             if straight_distance > 0:
                 curvature = total_distance / straight_distance
-                # 限制在合理范围内
                 return min(max(curvature, 1.0), 10.0)
             else:
                 return 1.0
@@ -177,24 +191,26 @@ class DeliveryRiderDataPreprocessor:
             return None
     
     def map_weather_score(self, weather_grade):
-        """将天气等级映射为数值分数"""
+        """天气评分映射 - 使用模糊匹配"""
         if not weather_grade:
             return 0
-            
-        # 简化天气映射，只保留三种天气类型
-        weather_mapping = {
-            "正常天气": 0,
-            "轻微恶劣天气": 1, 
-            "极恶劣天气": 2
-        }
         
-        # 尝试匹配
-        weather_str = str(weather_grade).strip()
-        for key, value in weather_mapping.items():
-            if key in weather_str:
-                return value
+        weather_str = str(weather_grade).strip().lower()
         
-        # 如果没有匹配到，返回默认值0
+        # 恶劣天气关键词
+        bad_weather_keywords = ['雨', '雪', '雾', '霾', '冰', '雹', '台风', '暴雨', '暴雪', 
+                                'rain', 'snow', 'hail', 'storm', 'heavy']
+        
+        for keyword in bad_weather_keywords:
+            if keyword in weather_str:
+                return 2
+        
+        # 轻微恶劣天气
+        moderate_keywords = ['阴', '多云', 'cloud', 'overcast']
+        for keyword in moderate_keywords:
+            if keyword in weather_str:
+                return 1
+        
         return 0
     
     def get_time_period(self, timestamp):
@@ -255,6 +271,13 @@ class DeliveryRiderDataPreprocessor:
             if wthr_grd is None:
                 wthr_grd = properties.get('weather_grade')  # 尝试其他可能的字段名
             
+            # 【新增】获取路线开始时间，用于排序
+            route_start_time = 0
+            if r_time_lst:
+                valid_times = [float(t) for t in r_time_lst if t is not None and float(t) > 0]
+                if valid_times:
+                    route_start_time = min(valid_times)
+
             # 只有路线级别的数据才计算这些特征
             if no_act > 0 and len(act_lst) > 0:
                 # 1. 个体行为特征
@@ -290,13 +313,49 @@ class DeliveryRiderDataPreprocessor:
                 # 区域拥堵度
                 city_avg_speed = 4.0
                 congestion_index = max(0, min(1, 1 - (avg_speed / city_avg_speed))) if city_avg_speed > 0 else 0
+                
+                # ==================== DSI计算:基于物理约束的配送紧迫指数 ====================
+                # DSI = α * (Required_Speed / Traffic_Speed) + β * (Current_Load / Max_Load)
+                # 这是一个客观的压力代理变量,不是主观打分
+                
+                # 计算Required_Speed:完成剩余订单所需的最小速度
+                if r_dur_all > 0 and avg_speed > 0:
+                    # 假设骑手需要在合理时间内完成所有订单
+                    # 实际距离 / 实际耗时 = 实际速度
+                    # 如果实际速度低于预期,说明有压力
+                    required_speed = r_dis_all / (r_dur_all * 0.8)  # 假设需要在80%时间内完成
+                else:
+                    required_speed = avg_speed
+                
+                # Traffic_Speed:该路段的通行速度(使用城市平均或实际平均速度)
+                traffic_speed = max(avg_speed, city_avg_speed)
+                
+                # 速度压力分量:实际需求速度与路况速度的比值
+                speed_strain = required_speed / traffic_speed if traffic_speed > 0 else 0
+                speed_strain = min(speed_strain, 3.0)  # 限制最大值避免异常
+                
+                # 负载压力分量:当前负载与最大负载的比值
+                load_strain = current_load / max_load if max_load > 0 else 0
+                
+                # DSI综合指数(权重可调)
+                alpha = 0.6  # 速度压力权重
+                beta = 0.4   # 负载压力权重
+                dsi = alpha * speed_strain + beta * load_strain
+                
+                # 归一化到[0, 1]区间并乘以10作为最终分数
+                dsi = min(max(dsi, 0), 2.0)  # 限制在[0, 2]
+                dsi_score = dsi * 5.0  # 映射到[0, 10]分
+                
             else:
-                # 对于无效的路线数据，返回空特征
+                # 对于无效的路线数据,返回空特征
                 order_rate = avg_interval = continuous_orders = load_intensity = act_entropy = 0
                 avg_speed = spd_dev = task_density = nav_ratio = task_per_km = 0
                 route_curvature = 1.0
                 weather_score = congestion_index = 0
                 time_period = "unknown"
+                dsi_score = 0.0
+                speed_strain = 0.0
+                load_strain = 0.0
             
             # 构建特征字典
             feature_dict = {
@@ -305,6 +364,12 @@ class DeliveryRiderDataPreprocessor:
                 'courier_id': courier_id,
                 'date': date,
                 'feature_type': 'route',
+                'route_start_time': route_start_time, # 辅助排序
+                
+                # ========== 核心目标变量:DSI (Delivery Strain Index) ==========
+                'dsi': dsi_score,  # 配送紧迫指数[0-10],这是我们要预测的Y
+                'speed_strain': speed_strain,  # 速度压力分量
+                'load_strain': load_strain,    # 负载压力分量
                 
                 # 个体行为特征
                 'order_rate': order_rate,
@@ -360,7 +425,7 @@ class DeliveryRiderDataPreprocessor:
             route_data = route_cache.get(route_id, {})
             
             if route_data and self.safe_float_conversion(route_data.get('no_act', 0)) > 0:
-                # 如果有有效的路线数据，使用路线数据计算特征
+                # 如果有有效的路线数据,使用路线数据计算特征
                 feature_dict = self.process_route_level_data(route_data, geometry)
                 if feature_dict:
                     # 添加动作点特定信息
@@ -371,6 +436,7 @@ class DeliveryRiderDataPreprocessor:
                         'action_type': action_type,
                         'feature_type': 'action_point_with_route'
                     })
+                    # 动作点继承路线的DSI
                 return feature_dict
             else:
                 # 如果没有对应的路线数据，创建基本特征记录
@@ -380,6 +446,11 @@ class DeliveryRiderDataPreprocessor:
                     'courier_id': courier_id,
                     'date': date,
                     'feature_type': 'action_point_only',
+                    
+                    # DSI相关(无路线数据,设为0)
+                    'dsi': 0.0,
+                    'speed_strain': 0.0,
+                    'load_strain': 0.0,
                     
                     # 动作点特定信息
                     'act_pt_id': act_pt_id,
@@ -423,22 +494,24 @@ class DeliveryRiderDataPreprocessor:
         print(f"正在处理文件: {file_path.name}")
         
         try:
-            # 读取GeoJSON文件
+            date_from_filename = self.extract_date_from_filename(file_path.name)
+            if not date_from_filename:
+                print(f"  [ERROR] 无法从文件名提取日期，跳过: {file_path.name}")
+                return pd.DataFrame()
+            
             with open(file_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             
-            # 首先构建路线数据缓存
-            route_cache = self.build_route_level_cache(data)
-            print(f"  找到 {len(route_cache)} 条路线级别数据")
-            
             features_list = []
             route_count = 0
-            action_point_count = 0
             
-            # 处理每个特征
             for feature in data.get('features', []):
                 properties = feature.get('properties', {})
                 geometry = feature.get('geometry', {})
+                
+                if 'date' not in properties or not properties.get('date'):
+                    properties['date'] = date_from_filename
+                
                 feature_type = properties.get('feature_type', '')
                 
                 if feature_type == 'route':
@@ -446,30 +519,33 @@ class DeliveryRiderDataPreprocessor:
                     if route_features:
                         features_list.append(route_features)
                         route_count += 1
-                
-                elif feature_type == 'action_point':
-                    action_features = self.process_action_point_data(properties, route_cache, geometry)
-                    if action_features:
-                        features_list.append(action_features)
-                        action_point_count += 1
-                else:
-                    # 处理没有明确类型的记录
-                    if self.get_route_id(properties):
-                        route_features = self.process_route_level_data(properties, geometry)
-                        if route_features:
-                            features_list.append(route_features)
-                            route_count += 1
             
             result_df = pd.DataFrame(features_list)
-            print(f"  处理完成: {route_count} 条路线 + {action_point_count} 个动作点 = 总共 {len(result_df)} 条记录")
             
-            # 显示一些调试信息
-            if len(result_df) > 0:
-                valid_weather = result_df[result_df['weather_score'] > 0]
-                varied_curvature = result_df[result_df['route_curvature'] != 1.0]
-                print(f"  有效天气记录: {len(valid_weather)} 条")
-                print(f"  变化路径曲折度: {len(varied_curvature)} 条")
+            # 【新增】累积特征构造逻辑
+            if len(result_df) > 0 and 'route_start_time' in result_df.columns:
+                # 1. 排序：确保按骑手和时间顺序排列
+                result_df.sort_values(by=['courier_id', 'route_start_time'], inplace=True)
                 
+                # 2. 构造累积特征
+                # 当天累计单量 (从1开始)
+                result_df['acc_orders_today'] = result_df.groupby('courier_id').cumcount() + 1
+                
+                # 当天累计里程 (单位: km)
+                result_df['acc_distance_today'] = result_df.groupby('courier_id')['r_dis_all'].cumsum() / 1000.0
+                
+                # 当天累计工作时长 (单位: hour)
+                result_df['acc_time_today'] = result_df.groupby('courier_id')['r_dur_all'].cumsum() / 3600.0
+                
+                print(f"    已构造累积特征: acc_orders_today, acc_distance_today, acc_time_today")
+
+            print(f"  处理完成: {route_count} 条路线数据")
+            
+            if len(result_df) > 0:
+                print(f"    DSI 统计: mean={result_df['dsi'].mean():.4f}, "
+                      f"min={result_df['dsi'].min():.4f}, max={result_df['dsi'].max():.4f}")
+                print(f"    天气评分分布: {result_df['weather_score'].value_counts().to_dict()}")
+            
             return result_df
             
         except Exception as e:
@@ -479,82 +555,43 @@ class DeliveryRiderDataPreprocessor:
             return pd.DataFrame()
     
     def process_all_data(self, output_dir="output_features"):
-        """处理所有数据，为每个文件单独输出结果"""
+        """处理所有数据，输出到output_features"""
         geojson_files = self.load_geojson_files()
         
-        # 创建输出目录
         output_path = Path(output_dir)
         output_path.mkdir(exist_ok=True)
         
         all_features = []
         
         for file_path in geojson_files:
-            print(f"\n{'='*50}")
+            print(f"\n{'='*60}")
             df = self.process_geojson_file(file_path)
             if not df.empty:
-                # 为每个文件单独保存
-                date_str = file_path.stem.replace('DeliveryRoutes_', '')
-                output_file = output_path / f"rider_features_{date_str}.csv"
-                df.to_csv(output_file, index=False, encoding='utf-8')
-                print(f"  已保存: {output_file}")
-                
-                all_features.append(df)
+                date_str = self.extract_date_from_filename(file_path.name)
+                if date_str:
+                    output_file = output_path / f"rider_features_{date_str}.csv"
+                    df.to_csv(output_file, index=False, encoding='utf-8')
+                    print(f"  已保存: {output_file}")
+                    all_features.append(df)
         
         if all_features:
             self.features_df = pd.concat(all_features, ignore_index=True)
-            
-            # 统计不同类型的数据
-            route_count = len(self.features_df[self.features_df['feature_type'] == 'route'])
-            action_with_route = len(self.features_df[self.features_df['feature_type'] == 'action_point_with_route'])
-            action_only = len(self.features_df[self.features_df['feature_type'] == 'action_point_only'])
-            
-            print(f"\n{'='*50}")
-            print(f"所有数据处理完成！")
-            print(f"路线级别数据: {route_count} 条")
-            print(f"动作点数据(有路线): {action_with_route} 条")
-            print(f"动作点数据(无路线): {action_only} 条")
-            print(f"总记录数: {len(self.features_df)} 条")
+            print(f"\n{'='*60}")
+            print(f"所有数据处理完成!")
+            print(f"总记录数: {len(self.features_df)}")
             print(f"输出文件保存在: {output_dir} 目录")
             
-            # 显示特征统计信息
-            self.display_feature_stats()
+            print(f"\n=== DSI统计 ===")
+            print(f"  均值: {self.features_df['dsi'].mean():.4f}")
+            print(f"  中位数: {self.features_df['dsi'].median():.4f}")
+            print(f"  标准差: {self.features_df['dsi'].std():.4f}")
+            print(f"  范围: [{self.features_df['dsi'].min():.4f}, {self.features_df['dsi'].max():.4f}]")
             
         return self.features_df
-    
-    def display_feature_stats(self):
-        """显示特征统计信息"""
-        if self.features_df.empty:
-            print("没有可用的特征数据")
-            return
-        
-        print(f"\n=== 整体数据统计 ===")
-        print(f"总记录数: {len(self.features_df)}")
-        
-        # 显示天气数据情况
-        weather_stats = self.features_df['weather_raw'].value_counts()
-        print(f"\n天气数据分布:")
-        for weather, count in weather_stats.head(10).items():
-            print(f"  {weather}: {count} 条")
-        
-        # 显示路径曲折度分布
-        curvature_stats = self.features_df['route_curvature'].describe()
-        print(f"\n路径曲折度统计:")
-        print(f"  均值: {curvature_stats['mean']:.4f}")
-        print(f"  标准差: {curvature_stats['std']:.4f}")
-        print(f"  最小值: {curvature_stats['min']:.4f}")
-        print(f"  最大值: {curvature_stats['max']:.4f}")
-        
-        # 显示动作点相关列的填充情况
-        action_columns = ['act_pt_id', 'act_time', 'act_order', 'action_type']
-        for col in action_columns:
-            if col in self.features_df.columns:
-                non_null_count = self.features_df[col].notna().sum()
-                print(f"  {col} 非空值: {non_null_count} 条")
 
-# 使用示例
 if __name__ == "__main__":
     # 设置数据目录路径
-    data_directory = "ODIDMob_Routes"  # 请修改为实际路径
+    data_directory = "./data/raw/ODIDMob_Routes"  # 请修改为实际路径
     
     # 创建预处理器实例
     preprocessor = DeliveryRiderDataPreprocessor(data_directory)
